@@ -49,6 +49,7 @@
 	max_encode_table_size => non_neg_integer(),
 	max_frame_size_received => 16384..16777215,
 	max_frame_size_sent => 16384..16777215 | infinity,
+	max_header_list_size => 0..16#ffffffff | infinity,
 	max_stream_window_size => 0..16#7fffffff,
 	preface_timeout => timeout(),
 	settings_timeout => timeout(),
@@ -248,14 +249,26 @@ settings_init(Opts) ->
 		initial_window_size, 65535),
 	S3 = setting_from_opt(S2, Opts, max_frame_size_received,
 		max_frame_size, 16384),
-	%% @todo max_header_list_size
-	setting_from_opt(S3, Opts, enable_connect_protocol,
+	%% We use a default of 32768 even though the protocol
+	%% default is infinity.
+	S4 = setting_from_opt(S3, Opts, max_header_list_size,
+		max_header_list_size, infinity, 32768),
+	setting_from_opt(S4, Opts, enable_connect_protocol,
 		enable_connect_protocol, false).
 
 setting_from_opt(Settings, Opts, OptName, SettingName, Default) ->
 	case maps:get(OptName, Opts, Default) of
 		Default -> Settings;
 		Value -> Settings#{SettingName => Value}
+	end.
+
+setting_from_opt(Settings, Opts, OptName, SettingName,
+		Default, DefaultIfMissing) ->
+	case Opts of
+		#{OptName := Default} -> Settings;
+		#{OptName := Value} -> Settings#{SettingName => Value};
+		#{} when Default =:= DefaultIfMissing -> Settings;
+		#{} -> Settings#{SettingName => DefaultIfMissing}
 	end.
 
 -spec init_stream(binary(), State)
@@ -501,12 +514,25 @@ client_headers_frame(_, State) ->
 headers_decode(Frame=#headers{head=head_fin, data=HeaderData},
 		State=#http2_machine{decode_state=DecodeState0}, Type, Stream) ->
 	try cow_hpack:decode(HeaderData, DecodeState0) of
-		{Headers, DecodeState} when Type =:= request ->
-			headers_enforce_concurrency_limit(Frame,
-				State#http2_machine{decode_state=DecodeState}, Type, Stream, Headers);
 		{Headers, DecodeState} ->
-			headers_pseudo_headers(Frame,
-				State#http2_machine{decode_state=DecodeState}, Type, Stream, Headers)
+			State1 = State#http2_machine{decode_state=DecodeState},
+			%% The whole block is decoded so the HPACK table
+			%% stays aligned with the peer. The limit applies
+			%% to the finished list because a failure during
+			%% decode is a connection error. (RFC9113 4.3)
+			%% This is safe because large binaries are
+			%% referenced rather than copied at this point.
+			case header_list_within_limit(Headers, State1) of
+				true when Type =:= request ->
+					headers_enforce_concurrency_limit(Frame, State1,
+						Type, Stream, Headers);
+				true ->
+					headers_pseudo_headers(Frame, State1, Type, Stream, Headers);
+				false ->
+					{error, {stream_error, Frame#headers.id, enhance_your_calm,
+						'The header list size is larger than the configured limit. (RFC9113 6.5.2)'},
+						header_list_reject(Type, Frame, State1)}
+			end
 	catch _:_ ->
 		{error, {connection_error, compression_error,
 			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'},
@@ -527,6 +553,283 @@ headers_enforce_concurrency_limit(Frame=#headers{id=StreamID},
 				'Maximum number of concurrent streams has been reached. (RFC7540 5.1.2)'},
 				State}
 	end.
+
+header_list_within_limit(Headers, #http2_machine{
+		local_settings=Local, next_settings=Next}) ->
+	case header_list_size_limit(Next, Local) of
+		infinity ->
+			true;
+		Limit ->
+			header_list_size(Headers, Limit, 0)
+	end.
+
+header_list_size_limit(#{max_header_list_size := Limit}, _) ->
+	Limit;
+header_list_size_limit(_, #{max_header_list_size := Limit}) ->
+	Limit;
+header_list_size_limit(_, _) ->
+	infinity.
+
+header_list_size([], _, _) ->
+	true;
+header_list_size([{Name, Value}|Tail], Limit, Size) ->
+	Size1 = Size + byte_size(Name) + byte_size(Value) + 32,
+	case Size1 > Limit of
+		true ->
+			false;
+		false ->
+			header_list_size(Tail, Limit, Size1)
+	end.
+
+%% The promised response may already be in flight. Close the id
+%% so those frames are ignored. (RFC7540 5.1, RFC7540 6.6)
+header_list_reject(push_promise, #headers{id=PromisedStreamID}, State) ->
+	stream_linger(PromisedStreamID,
+		State#http2_machine{remote_streamid=PromisedStreamID});
+%% The stream is already open. Drop it so later frames are ignored
+%% and it does not keep a concurrency slot.
+header_list_reject(Type, #headers{id=StreamID},
+		State=#http2_machine{streams=Streams0})
+		when Type =:= response; Type =:= trailers ->
+	Streams = lists:keydelete(StreamID, #stream.id, Streams0),
+	stream_linger(StreamID, State#http2_machine{streams=Streams});
+%% Requests are rejected before the stream exists. Do not
+%% linger the id or advance remote_streamid.
+header_list_reject(_, _, State) ->
+	State.
+
+-ifdef(TEST).
+
+header_list_size_default_advertised_test() ->
+	{ok, _, S0} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	#{max_header_list_size := 32768} = S0#http2_machine.next_settings,
+	{ok, _, S1} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity,
+		max_header_list_size => infinity
+	}),
+	false = maps:is_key(max_header_list_size, S1#http2_machine.next_settings),
+	{ok, _, S2} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity,
+		max_header_list_size => 65536
+	}),
+	#{max_header_list_size := 65536} = S2#http2_machine.next_settings,
+	ok.
+
+header_list_size_indexed_test() ->
+	%% Eight copies are within 32768. Nine are not. Counting the
+	%% shared value once would accept nine.
+	ValueA = binary:copy(<<$a>>, 4000),
+	ValueB = binary:copy(<<$b>>, 4000),
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Block8, Enc1} = cow_hpack:encode(
+		Headers ++ lists:duplicate(8, {<<"user-agent">>, ValueA}),
+		cow_hpack:init(), #{huffman => false}),
+	{Block9, Enc2} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, ValueB}),
+		Enc1, #{huffman => false}),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	Decode0 = S0#http2_machine.decode_state,
+	{ok, {headers, 1, fin, _, _, _}, S1}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(Block8)}, S0),
+	true = S1#http2_machine.decode_state =/= Decode0,
+	{error, {stream_error, 3, enhance_your_calm, _}, S2}
+		= frame({headers, 3, fin, head_fin, iolist_to_binary(Block9)}, S1),
+	%% The rejected block was decoded: the dynamic table now has
+	%% the "b" value, not the "a" value from the previous request.
+	{Follow, _} = cow_hpack:encode(
+		Headers ++ [{<<"user-agent">>, ValueB}],
+		Enc2, #{huffman => false}),
+	{ok, {headers, 5, fin, [{<<"user-agent">>, Referenced}], _, _}, _}
+		= frame({headers, 5, fin, head_fin, iolist_to_binary(Follow)}, S2),
+	4000 = byte_size(Referenced),
+	$b = binary:first(Referenced),
+	ok.
+
+header_list_size_before_and_after_ack_test() ->
+	Value = binary:copy(<<$a>>, 4000),
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Block0, _} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
+		cow_hpack:init(), #{huffman => false}),
+	Block = iolist_to_binary(Block0),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{error, {stream_error, 1, enhance_your_calm, _}, _}
+		= frame({headers, 1, fin, head_fin, Block}, S0),
+	{ok, S1} = frame(settings_ack, S0),
+	{error, {stream_error, 1, enhance_your_calm, _}, _}
+		= frame({headers, 1, fin, head_fin, Block}, S1),
+	ok.
+
+header_list_size_infinity_test() ->
+	Value = binary:copy(<<$a>>, 4000),
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Block0, _} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
+		cow_hpack:init(), #{huffman => false}),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity,
+		max_header_list_size => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{ok, {headers, 1, fin, _, _, _}, _}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(Block0)}, S0),
+	ok.
+
+header_list_size_zero_test() ->
+	{Block0, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	]),
+	Block = iolist_to_binary(Block0),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity,
+		max_header_list_size => 0
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{error, {stream_error, 1, enhance_your_calm, _}, _}
+		= frame({headers, 1, fin, head_fin, Block}, S0),
+	ok.
+
+header_list_size_response_test() ->
+	%% :status 200 is 42 octets. user-agent adds 42 + ValueSize.
+	At = 32768 - (42 + 42),
+	32768 = 42 + 42 + At,
+	{AtBlock, _} = cow_hpack:encode([
+		{<<":status">>, <<"200">>},
+		{<<"user-agent">>, binary:copy(<<$a>>, At)}
+	], cow_hpack:init(), #{huffman => false}),
+	{OverBlock, _} = cow_hpack:encode([
+		{<<":status">>, <<"200">>},
+		{<<"user-agent">>, binary:copy(<<$a>>, At + 1)}
+	], cow_hpack:init(), #{huffman => false}),
+	{Small, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+	{ok, _, C00} = init(client, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, C0} = frame({settings, #{}}, C00),
+	{ok, 1, C1} = init_stream(<<"GET">>, C0),
+	{ok, {headers, 1, fin, _, _, _}, _}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(AtBlock)}, C1),
+	{error, {stream_error, 1, enhance_your_calm, _}, C2}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(OverBlock)}, C1),
+	%% The stream is gone and its id lingers. Later DATA frames
+	%% on that id are ignored.
+	undefined = stream_get(1, C2),
+	{ok, C3} = frame({data, 1, fin, <<"x">>}, C2),
+	{ok, 3, C4} = init_stream(<<"GET">>, C3),
+	{ok, {headers, 3, fin, _, _, _}, _}
+		= frame({headers, 3, fin, head_fin, iolist_to_binary(Small)}, C4),
+	ok.
+
+header_list_size_push_promise_test() ->
+	Value = binary:copy(<<$a>>, 4000),
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Over0, _} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
+		cow_hpack:init(), #{huffman => false}),
+	Over = iolist_to_binary(Over0),
+	{Min0, _} = cow_hpack:encode(Headers),
+	Min = iolist_to_binary(Min0),
+	{ok, _, C00} = init(client, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, C0} = frame({settings, #{}}, C00),
+	{ok, 1, C1} = init_stream(<<"GET">>, C0),
+	{error, {stream_error, 2, enhance_your_calm, _}, C2}
+		= frame({push_promise, 1, head_fin, 2, Over}, C1),
+	2 = get_last_streamid(C2),
+	%% The promised response may already be in flight.
+	{ok, C3} = frame({data, 2, fin, <<"hi">>}, C2),
+	{ok, {push_promise, 1, 4, _, _}, C4}
+		= frame({push_promise, 1, head_fin, 4, Min}, C3),
+	{Small0, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+	{ok, {headers, 1, fin, _, _, _}, _}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(Small0)}, C4),
+	ok.
+
+header_list_size_continuation_test() ->
+	Value = binary:copy(<<$a>>, 4000),
+	Headers = [
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Block0, _} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
+		cow_hpack:init(), #{huffman => false}),
+	<<First:1/binary, Rest/binary>> = iolist_to_binary(Block0),
+	{Min0, _} = cow_hpack:encode(Headers),
+	Min = iolist_to_binary(Min0),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity,
+		max_fragmented_header_block_size => 65536
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{ok, S1} = frame({headers, 1, fin, head_nofin, First}, S0),
+	{error, {stream_error, 1, enhance_your_calm, _}, S2}
+		= frame({continuation, 1, head_fin, Rest}, S1),
+	{ok, {headers, 3, fin, _, _, _}, _}
+		= frame({headers, 3, fin, head_fin, Min}, S2),
+	ok.
+
+header_list_size_trailers_test() ->
+	Value = binary:copy(<<$a>>, 4000),
+	{Req0, Enc} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	]),
+	{Trailers0, _} = cow_hpack:encode(
+		lists:duplicate(9, {<<"x-trailer">>, Value}),
+		Enc, #{huffman => false}),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{ok, {headers, 1, nofin, _, _, _}, S1}
+		= frame({headers, 1, nofin, head_fin, iolist_to_binary(Req0)}, S0),
+	{error, {stream_error, 1, enhance_your_calm, _}, S2}
+		= frame({headers, 1, fin, head_fin, iolist_to_binary(Trailers0)}, S1),
+	undefined = stream_get(1, S2),
+	ok.
+
+-endif.
 
 headers_pseudo_headers(Frame, State=#http2_machine{local_settings=LocalSettings},
 		Type, Stream, Headers0) when Type =:= request; Type =:= push_promise ->
