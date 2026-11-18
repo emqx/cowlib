@@ -808,6 +808,21 @@ header_list_size_continuation_test() ->
 		= frame({headers, 3, fin, head_fin, Min}, S2),
 	ok.
 
+fragmented_header_block_size_test() ->
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	Chunk = binary:copy(<<0>>, 16384),
+	{ok, S1} = frame({headers, 1, fin, head_nofin, Chunk}, S0),
+	{ok, S2} = frame({continuation, 1, head_nofin, Chunk}, S1),
+	{error, {connection_error, enhance_your_calm, _}, _}
+		= frame({continuation, 1, head_nofin, <<0>>}, S2),
+	{error, {connection_error, enhance_your_calm, _}, _}
+		= frame({continuation, 1, head_fin, <<0>>}, S2),
+	ok.
+
 header_list_size_trailers_test() ->
 	Value = binary:copy(<<$a>>, 4000),
 	{Req0, Enc} = cow_hpack:encode([
