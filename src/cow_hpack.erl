@@ -1493,13 +1493,21 @@ table_get_name(Index, #state{dyn_table=DynamicTable}) ->
 
 table_insert(Entry = {Name, Value}, State=#state{size=Size, max_size=MaxSize, dyn_table=DynamicTable}) ->
 	EntrySize = byte_size(Name) + byte_size(Value) + 32,
-	{DynamicTable2, Size2} = if
-		Size + EntrySize > MaxSize ->
-			table_resize(DynamicTable, MaxSize - EntrySize, 0, []);
-		true ->
-			{DynamicTable, Size}
-	end,
-	State#state{size=Size2 + EntrySize, dyn_table=[{EntrySize, Entry}|DynamicTable2]}.
+	if
+		EntrySize + Size =< MaxSize ->
+			%% Add entry without eviction
+			State#state{size=Size + EntrySize, dyn_table=[{EntrySize, Entry}|DynamicTable]};
+		EntrySize =< MaxSize ->
+			%% Evict, then add entry
+			{DynamicTable2, Size2} = table_resize(DynamicTable, MaxSize - EntrySize, 0, []),
+			State#state{size=Size2 + EntrySize, dyn_table=[{EntrySize, Entry}|DynamicTable2]};
+		EntrySize > MaxSize ->
+			%% "an attempt to add an entry larger than the
+			%% maximum size causes the table to be emptied
+			%% of all existing entries and results in an
+			%% empty table" (RFC 7541, 4.4)
+			State#state{size=0, dyn_table=[]}
+	end.
 
 table_resize([], _, Size, Acc) ->
 	{lists:reverse(Acc), Size};
@@ -1526,4 +1534,14 @@ prop_str_huffman() ->
 	?FORALL(Str, binary(), begin
 		{Str, <<>>} =:= dec_str(iolist_to_binary(enc_str(Str, #{huffman => true})))
 	end).
+
+table_insert_larger_than_max_size_test() ->
+	%% The entry is larger than the default 4096 table size.
+	%% It must empty the table, not be added. (RFC7541 4.4)
+	Small = {<<"x-small">>, <<"value">>},
+	Big = {<<"x-big">>, binary:copy(<<$a>>, 5000)},
+	S1 = table_insert(Small, init()),
+	#state{size=44, dyn_table=[{44, Small}]} = S1,
+	#state{size=0, dyn_table=[]} = table_insert(Big, S1),
+	ok.
 -endif.
