@@ -187,6 +187,10 @@ dec_lit_no_index(Rest, State, Acc, Name) ->
 %% The HPACK format has 4 different integer prefixes length (from 4 to 7)
 %% and each can be used to create an indefinite length integer if all bits
 %% of the prefix are set to 1.
+%%
+%% We hard limit indefinite length integers to 38bits. The maximum
+%% possible value is large enough for normal use cases and does
+%% not produce an Erlang big int.
 
 dec_int5(<< 2#11111:5, Rest/bits >>) ->
 	dec_big_int(Rest, 31, 0);
@@ -195,7 +199,7 @@ dec_int5(<< Int:5, Rest/bits >>) ->
 
 dec_big_int(<< 0:1, Value:7, Rest/bits >>, Int, M) ->
 	{Int + (Value bsl M), Rest};
-dec_big_int(<< 1:1, Value:7, Rest/bits >>, Int, M) ->
+dec_big_int(<< 1:1, Value:7, Rest/bits >>, Int, M) when M < 32 ->
 	dec_big_int(Rest, Int + (Value bsl M), M + 7).
 
 %% Decode a string.
@@ -252,6 +256,15 @@ dec_huffman(Rest, 0, _, <<>>) ->
 %% Test case extracted from h2spec.
 decode_reject_eos_test() ->
 	{'EXIT', _} = (catch decode(<<16#0085f2b24a84ff874951fffffffa7f:120>>)),
+	ok.
+
+decode_reject_very_big_int_test() ->
+	VeryBigInt0 = binary:copy(<<16#ff>>, 32767),
+	VeryBigInt = <<VeryBigInt0/binary, 16#7f>>,
+	garbage_collect(),
+	Prev = process_flag(max_heap_size, #{size => 10000, kill => true}),
+	{'EXIT', _} = (catch decode(VeryBigInt)),
+	process_flag(max_heap_size, Prev),
 	ok.
 
 req_decode_test() ->
