@@ -207,6 +207,15 @@ decode_reject_eos_test() ->
 	{'EXIT', _} = (catch decode(<<16#0085f2b24a84ff874951fffffffa7f:120>>)),
 	ok.
 
+decode_reject_very_big_int_test() ->
+	VeryBigInt0 = binary:copy(<<16#ff>>, 32767),
+	VeryBigInt = <<VeryBigInt0/binary, 16#7f>>,
+	garbage_collect(),
+	Prev = process_flag(max_heap_size, #{size => 10000, kill => true}),
+	{'EXIT', _} = (catch decode(VeryBigInt)),
+	process_flag(max_heap_size, Prev),
+	ok.
+
 req_decode_test() ->
 	%% First request (raw then huffman).
 	{Headers1, State1} = decode(<< 16#828684410f7777772e6578616d706c652e636f6d:160 >>),
