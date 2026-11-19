@@ -624,10 +624,11 @@ header_list_reject(Type, #headers{id=StreamID},
 		when Type =:= response; Type =:= trailers ->
 	Streams = maps:remove(StreamID, Streams0),
 	stream_linger(StreamID, State#http2_machine{streams=Streams});
-%% Requests are rejected before the stream exists. Do not
-%% linger the id or advance remote_streamid.
-header_list_reject(_, _, State) ->
-	State.
+%% The request never became a stream. Close the id so frames the
+%% client already sent for it, such as the request body, are ignored.
+header_list_reject(request, #headers{id=StreamID}, State) ->
+	stream_linger(StreamID,
+		State#http2_machine{remote_streamid=StreamID}).
 
 -ifdef(TEST).
 
@@ -687,6 +688,32 @@ header_list_size_indexed_test() ->
 		= frame({headers, 5, fin, head_fin, iolist_to_binary(Follow)}, S2),
 	4000 = byte_size(Referenced),
 	$b = binary:first(Referenced),
+	ok.
+
+header_list_size_request_body_test() ->
+	%% A rejected request can have its body in flight. The DATA
+	%% frames must be ignored and the connection stay usable.
+	Headers = [
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":path">>, <<"/">>}
+	],
+	{Big, Enc1} = cow_hpack:encode(
+		Headers ++ lists:duplicate(9, {<<"user-agent">>, binary:copy(<<$a>>, 4000)}),
+		cow_hpack:init(), #{huffman => false}),
+	{Small, _} = cow_hpack:encode(Headers, Enc1, #{huffman => false}),
+	{ok, _, S00} = init(server, #{
+		preface_timeout => infinity,
+		settings_timeout => infinity
+	}),
+	{ok, S0} = frame({settings, #{}}, S00),
+	{error, {stream_error, 1, enhance_your_calm, _}, S1}
+		= frame({headers, 1, nofin, head_fin, iolist_to_binary(Big)}, S0),
+	true = is_lingering_stream(1, S1),
+	{ok, S2} = frame({data, 1, nofin, <<"body">>}, S1),
+	{ok, S3} = frame({data, 1, fin, <<"more">>}, S2),
+	{ok, {headers, 3, fin, _, _, _}, _}
+		= frame({headers, 3, fin, head_fin, iolist_to_binary(Small)}, S3),
 	ok.
 
 header_list_size_before_and_after_ack_test() ->
